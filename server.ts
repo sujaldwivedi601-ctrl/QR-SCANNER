@@ -467,35 +467,66 @@ async function runPlaywrightWorkflow(
     const context = await browser.newContext({
       viewport: { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      permissions: ['geolocation'],
+      geolocation: { latitude: 19.0760, longitude: 72.8777 },
     });
 
     const page = await context.newPage();
 
     addLog('OPEN_WEBSITE', 'info', `Connecting to page...`);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForLoadState('networkidle').catch(() => {});
+    await page.waitForSelector('input', { timeout: 8000 }).catch(() => {});
     addLog('OPEN_WEBSITE', 'success', `Page loaded: ${await page.title()}`);
 
-    // Step C: Find phone number field using semantic selectors
+    // Automatically inject mock geolocation into hidden inputs if present (e.g. CEAT form)
+    await page.evaluate(() => {
+      const lat = document.querySelector('input#latitude, input[name="latitude"]') as HTMLInputElement;
+      const lon = document.querySelector('input#longitude, input[name="longitude"]') as HTMLInputElement;
+      if (lat && !lat.value) lat.value = '19.0760';
+      if (lon && !lon.value) lon.value = '72.8777';
+    });
+
+    // Step C: Clean and sanitize phone number format
+    // Extract pure digits: 10-digit national number for Indian/intlTelInput forms
+    const digitsOnly = phoneNumber.replace(/\D/g, '');
+    let clean10DigitNumber = digitsOnly;
+    if (digitsOnly.length === 12 && digitsOnly.startsWith('91')) {
+      clean10DigitNumber = digitsOnly.substring(2);
+    } else if (digitsOnly.length === 11 && digitsOnly.startsWith('0')) {
+      clean10DigitNumber = digitsOnly.substring(1);
+    } else if (digitsOnly.length > 10) {
+      clean10DigitNumber = digitsOnly.slice(-10);
+    }
+
     addLog('FIND_PHONE', 'info', `Scanning DOM for phone input field...`);
     const phoneSelectors = [
+      'input#mobile_code',
+      'input[name="mobile_number"]',
+      'input.enter_number',
       'input[type="tel"]',
+      'input[type="number"][placeholder*="phone" i]',
+      'input[type="number"][placeholder*="mobile" i]',
+      'input[placeholder*="phone" i]',
+      'input[placeholder*="mobile" i]',
       'input[name*="phone" i]',
       'input[name*="mobile" i]',
       'input[id*="phone" i]',
       'input[id*="mobile" i]',
-      'input[placeholder*="phone" i]',
-      'input[placeholder*="mobile" i]',
       'input[autocomplete="tel"]',
+      'input[type="number"]',
       'label:has-text("phone") + input',
       'label:has-text("mobile") + input',
     ];
 
     let phoneHandle = null;
+    let selectedSelector = '';
     for (const selector of phoneSelectors) {
       try {
         const el = page.locator(selector).first();
         if ((await el.count()) > 0 && (await el.isVisible())) {
           phoneHandle = el;
+          selectedSelector = selector;
           break;
         }
       } catch {
@@ -509,15 +540,27 @@ async function runPlaywrightWorkflow(
       return { status: 'PHONE_FIELD_NOT_FOUND', errorReason: 'Phone input element not found' };
     }
 
-    addLog('FIND_PHONE', 'success', 'Found phone input element');
-    await phoneHandle.fill(phoneNumber);
-    addLog('FILL_PHONE', 'info', `Entered authorized phone: ${phoneNumber}`);
+    // Determine whether this input requires pure digits (e.g. type="number" or intlTelInput)
+    const inputType = await phoneHandle.getAttribute('type');
+    const isNumberField = inputType === 'number';
+    const isIntlTel = (await page.locator('.iti__selected-flag, .selected-flag, .iti').count()) > 0;
+
+    // Use 10-digit clean number if type="number" or intlTelInput, otherwise use digits
+    const valueToFill = (isNumberField || isIntlTel) ? clean10DigitNumber : (clean10DigitNumber || phoneNumber);
+
+    addLog('FIND_PHONE', 'success', `Found phone input element (${selectedSelector})`);
+    await phoneHandle.click();
+    await phoneHandle.fill(valueToFill);
+    await phoneHandle.dispatchEvent('input');
+    await phoneHandle.dispatchEvent('change');
+    addLog('FILL_PHONE', 'info', `Entered authorized phone: ${valueToFill}`);
 
     // Step D: Detect "Generate OTP" / "Send OTP" button
     addLog('FIND_OTP_BUTTON', 'info', `Detecting OTP generation button...`);
     const otpButtonSelectors = [
-      'button:has-text("Generate OTP")',
+      'button#send_otp',
       'button:has-text("Send OTP")',
+      'button:has-text("Generate OTP")',
       'button:has-text("Get OTP")',
       'button:has-text("Request OTP")',
       'button:has-text("Continue")',
@@ -547,19 +590,26 @@ async function runPlaywrightWorkflow(
     }
 
     await otpBtnHandle.click();
-    addLog('CLICK_GENERATE_OTP', 'success', 'Clicked Generate OTP button');
+    addLog('CLICK_GENERATE_OTP', 'success', 'Clicked Send/Generate OTP button');
 
-    // Check if website displays a visible limit reached error
-    await page.waitForTimeout(1000);
+    // Check if website displays an alert or limit reached error
+    await page.waitForTimeout(1200);
     try {
-      const errorEl = page.locator('#errorBanner, .error-banner, [role="alert"]').first();
+      const errorEl = page.locator('#errorBanner, .error-banner, #error_in_max_reached, [role="alert"]').first();
       if ((await errorEl.count()) > 0 && (await errorEl.isVisible())) {
         const errText = (await errorEl.innerText()).toLowerCase();
-        if (errText.includes('limit') || errText.includes('too many attempts') || errText.includes('daily limit')) {
+        if (errText.includes('limit') || errText.includes('too many') || errText.includes('daily limit') || errText.includes('max')) {
           addLog('LIMIT_DETECTED', 'warning', 'Website reported phone limit reached. Ready for authorized rotation.');
           await browser.close();
           return { status: 'FAILED', errorReason: 'Service limit reached for this number' };
         }
+      }
+
+      // Check SweetAlert error prompt
+      const swalTitle = page.locator('.swal2-title, .swal2-html-container');
+      if ((await swalTitle.count()) > 0 && (await swalTitle.first().isVisible())) {
+        const swalText = await swalTitle.first().innerText();
+        addLog('SITE_NOTICE', 'info', `Portal notice: ${swalText.substring(0, 100)}`);
       }
     } catch {
       // no error banner
@@ -583,7 +633,7 @@ async function runPlaywrightWorkflow(
     let otpCode: string;
     try {
       const timeout = settings?.otpTimeoutSeconds || 60;
-      otpCode = await waitForOtpInput(jobId, phoneNumber, timeout, addLog, knownOtp);
+      otpCode = await waitForOtpInput(jobId, clean10DigitNumber, timeout, addLog, knownOtp);
     } catch (otpErr: any) {
       await browser.close();
       if (otpErr.message === 'OTP_TIMEOUT') {
@@ -592,44 +642,87 @@ async function runPlaywrightWorkflow(
       return { status: 'OTP_INVALID', errorReason: otpErr.message };
     }
 
-    // Step F: Detect and fill OTP input field
-    addLog('ENTER_OTP', 'info', `Locating OTP input field...`);
-    const otpInputSelectors = [
-      'input[name*="otp" i]',
-      'input[id*="otp" i]',
-      'input[placeholder*="otp" i]',
-      'input[autocomplete="one-time-code"]',
-      'input[maxlength="6"]',
-      'input[type="text"][maxlength="6"]',
-    ];
+    // Step F: Detect and fill OTP input field (Handles both single OTP input and split 4-digit inputs)
+    addLog('ENTER_OTP', 'info', `Locating OTP input fields...`);
 
-    let otpInputHandle = null;
-    for (const selector of otpInputSelectors) {
-      try {
-        const el = page.locator(selector).first();
-        if ((await el.count()) > 0 && (await el.isVisible())) {
-          otpInputHandle = el;
-          break;
+    // Check for split 4-digit inputs like #first, #second, #third, #fourth (e.g. CEAT form)
+    const splitOtpFirst = page.locator('#first, input#first, #otp input:first-child').first();
+    let filledSplit = false;
+
+    if ((await splitOtpFirst.count()) > 0 && (await splitOtpFirst.isVisible())) {
+      const digits = otpCode.replace(/\D/g, '').split('');
+      const splitInputSelectors = ['#first', '#second', '#third', '#fourth', '#fifth', '#sixth'];
+      for (let d = 0; d < digits.length && d < splitInputSelectors.length; d++) {
+        const digitEl = page.locator(splitInputSelectors[d]).first();
+        if ((await digitEl.count()) > 0) {
+          await digitEl.fill(digits[d]);
+          await digitEl.dispatchEvent('input');
+          await digitEl.dispatchEvent('keyup');
         }
-      } catch {
-        // continue
+      }
+      filledSplit = true;
+      addLog('ENTER_OTP', 'success', `Filled ${digits.length}-digit split OTP code into inputs`);
+    }
+
+    if (!filledSplit) {
+      const otpInputSelectors = [
+        'input[name*="otp" i]',
+        'input[id*="otp" i]',
+        'input[placeholder*="otp" i]',
+        'input[autocomplete="one-time-code"]',
+        'input[maxlength="6"]',
+        'input[maxlength="4"]',
+        'input[type="text"][maxlength="6"]',
+        'input[type="number"][maxlength="6"]',
+      ];
+
+      let otpInputHandle = null;
+      for (const selector of otpInputSelectors) {
+        try {
+          const el = page.locator(selector).first();
+          if ((await el.count()) > 0 && (await el.isVisible())) {
+            otpInputHandle = el;
+            break;
+          }
+        } catch {
+          // continue
+        }
+      }
+
+      if (otpInputHandle) {
+        await otpInputHandle.fill(otpCode);
+        await otpInputHandle.dispatchEvent('input');
+        await otpInputHandle.dispatchEvent('change');
+        addLog('ENTER_OTP', 'success', `Filled OTP code into verification field`);
+      } else {
+        addLog('ENTER_OTP', 'warning', 'No standard single OTP field found, checking form handlers');
       }
     }
 
-    if (!otpInputHandle) {
-      addLog('ENTER_OTP', 'error', 'OTP input field not found on page');
-      await browser.close();
-      return { status: 'OTP_INVALID', errorReason: 'OTP input field missing' };
+    // Auto-check Terms and Conditions checkbox if required (e.g. #customCheck on CEAT)
+    try {
+      const tncCheckbox = page.locator('#customCheck, input[name="example1"], input[type="checkbox"]').first();
+      if ((await tncCheckbox.count()) > 0) {
+        await page.evaluate(() => {
+          const cb = document.querySelector('#customCheck, input[type="checkbox"]') as HTMLInputElement;
+          if (cb && !cb.checked) {
+            cb.checked = true;
+            cb.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        });
+        addLog('TNC_CHECK', 'info', 'Agreed to Terms & Conditions checkbox');
+      }
+    } catch {
+      // ignore
     }
-
-    await otpInputHandle.fill(otpCode);
-    addLog('ENTER_OTP', 'success', `Filled OTP code into verification field`);
 
     // Step G: Submit / Verify
     addLog('SUBMIT_VERIFY', 'info', `Clicking Verify / Submit action...`);
     const verifyButtonSelectors = [
-      'button:has-text("Verify")',
+      'button.verify_otp_btn',
+      'button:has-text("SUBMIT")',
       'button:has-text("Submit")',
+      'button:has-text("Verify")',
       'button:has-text("Continue")',
       'button:has-text("Confirm")',
       'button:has-text("Proceed")',
@@ -652,6 +745,13 @@ async function runPlaywrightWorkflow(
     if (verifyBtnHandle) {
       await verifyBtnHandle.click();
       addLog('SUBMIT_VERIFY', 'info', `Clicked verification submit button`);
+    } else {
+      // Try invoking verify_mobile directly if available
+      await page.evaluate(() => {
+        if (typeof (window as any).verify_mobile === 'function') {
+          (window as any).verify_mobile();
+        }
+      });
     }
 
     // Step H: Success Verification Layer

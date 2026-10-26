@@ -52,14 +52,23 @@ export const PhoneRegistry: React.FC<PhoneRegistryProps> = ({
     setEditMaxLimit(p.maxLimit);
   };
 
+  const sanitizeMobile = (val: string) => {
+    const digits = val.replace(/\D/g, '');
+    if (digits.length === 12 && digits.startsWith('91')) return digits.substring(2);
+    if (digits.length === 11 && digits.startsWith('0')) return digits.substring(1);
+    if (digits.length > 10) return digits.slice(-10);
+    return digits || val.trim();
+  };
+
   const handleSaveEdit = (id: string) => {
     if (!editNumber.trim()) return;
+    const clean = sanitizeMobile(editNumber);
     const updated = phoneNumbers.map((p) => {
       if (p.id === id) {
         return {
           ...p,
           label: editLabel.trim() || p.label,
-          number: editNumber.trim(),
+          number: clean,
           maxLimit: Math.max(1, editMaxLimit),
         };
       }
@@ -78,10 +87,11 @@ export const PhoneRegistry: React.FC<PhoneRegistryProps> = ({
       return;
     }
 
+    const clean = sanitizeMobile(newNumber);
     const newItem: PhoneNumberUsage = {
       id: `pn-${Date.now()}`,
       label: newLabel.trim() || `Authorized Line ${phoneNumbers.length + 1}`,
-      number: newNumber.trim(),
+      number: clean,
       status: phoneNumbers.length === 0 ? 'active' : 'available',
       usageCount: 0,
       maxLimit: Math.max(1, newMaxLimit),

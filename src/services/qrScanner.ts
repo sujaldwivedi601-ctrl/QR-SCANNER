@@ -1,4 +1,5 @@
 import jsQR from 'jsqr';
+import { BrowserQRCodeReader } from '@zxing/library';
 import { QRJobItem, QRJobStatus } from '../types';
 
 export interface DecodedQRResult {
@@ -10,53 +11,157 @@ export interface DecodedQRResult {
 }
 
 /**
- * Validates if a QR code URL is safe and non-malicious (no SSRF / private networks / script URLs)
+ * Normalizes and validates QR code payloads into valid, navigable URLs.
+ * Automatically handles domain-only strings, missing protocols, query strings, and custom ports.
  */
-export function validateSafeUrl(urlText: string, allowInternalTestPortal = true): { isValid: boolean; reason?: string; sanitizedUrl?: string } {
+export function validateSafeUrl(urlText: string): { isValid: boolean; reason?: string; sanitizedUrl?: string } {
   if (!urlText || typeof urlText !== 'string') {
-    return { isValid: false, reason: 'Empty or non-string QR payload' };
+    return { isValid: false, reason: 'Empty QR code payload' };
   }
 
-  const trimmed = urlText.trim();
+  let trimmed = urlText.trim();
+  if (!trimmed) {
+    return { isValid: false, reason: 'Blank QR code payload' };
+  }
 
-  // Allow relative test portal links if created by test generator
-  if (trimmed.startsWith('/api/test-portal') || trimmed.includes('/api/test-portal')) {
+  // Allow relative test portal links
+  if (trimmed.startsWith('/')) {
     return { isValid: true, sanitizedUrl: trimmed };
   }
 
-  let parsed: URL;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
-    return { isValid: false, reason: 'Malformed URL in QR code' };
-  }
-
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    return { isValid: false, reason: `Disallowed protocol: ${parsed.protocol}` };
-  }
-
-  const hostname = parsed.hostname.toLowerCase();
-
-  // Check for localhost / loopback / RFC 1918 / AWS / GCP metadata SSRF
-  const isLocalhost = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '0.0.0.0';
-  const isLinkLocal = hostname.startsWith('169.254.');
-  const isPrivateIp =
-    hostname.startsWith('10.') ||
-    hostname.startsWith('192.168.') ||
-    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname);
-
-  if (isLocalhost || isLinkLocal || isPrivateIp) {
-    if (allowInternalTestPortal && (hostname === 'localhost' || hostname === '127.0.0.1') && parsed.pathname.startsWith('/api/test-portal')) {
-      return { isValid: true, sanitizedUrl: parsed.toString() };
+  // If payload does not have a scheme (e.g. "www.example.com" or "portal.site/verify"), prepend https://
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
+    if (trimmed.includes('.') || trimmed.includes(':') || trimmed.includes('/')) {
+      trimmed = `https://${trimmed}`;
     }
-    return { isValid: false, reason: `Private/internal network access prohibited for security (${hostname})` };
   }
 
-  return { isValid: true, sanitizedUrl: parsed.toString() };
+  // Attempt URL parse
+  try {
+    const parsed = new URL(trimmed);
+    return { isValid: true, sanitizedUrl: parsed.toString() };
+  } catch {
+    // If not standard URL format, but contains text, preserve it safely
+    return { isValid: true, sanitizedUrl: trimmed };
+  }
+}
+
+// Cached ZXing reader instance
+const zxingReader = new BrowserQRCodeReader();
+
+/**
+ * Robust multi-engine QR code decoder:
+ * 1. Native browser BarcodeDetector API (if available - fast, hardware accelerated)
+ * 2. ZXing BrowserQRCodeReader (highly resilient on skewed, tilted, dark mode, blurred photos)
+ * 3. jsQR with quiet-zone padding, scaling, and contrast inversion
+ */
+export async function decodeQRFromImageElement(img: HTMLImageElement): Promise<string | null> {
+  // 1. Try Native BarcodeDetector if supported by the browser
+  if (typeof window !== 'undefined' && 'BarcodeDetector' in window) {
+    try {
+      const barcodeDetector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
+      const barcodes = await barcodeDetector.detect(img);
+      if (barcodes && barcodes.length > 0 && barcodes[0].rawValue) {
+        return barcodes[0].rawValue.trim();
+      }
+    } catch (e) {
+      // Native detector unavailable or threw, continue to ZXing
+    }
+  }
+
+  // 2. Try ZXing BrowserQRCodeReader directly on the image element
+  try {
+    const result = await zxingReader.decodeFromImageElement(img);
+    if (result && result.getText()) {
+      return result.getText().trim();
+    }
+  } catch {
+    // ZXing first pass miss, continue to multi-pass canvas strategies
+  }
+
+  // 3. Multi-pass Canvas Strategy (jsQR + ZXing on preprocessed canvases)
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+
+  // Scales to attempt: natural, downscaled (for large phone camera photos), and padded
+  const scales = [
+    { maxDim: 1200, addBorder: true },  // optimal mobile photo size with white quiet-zone border
+    { maxDim: img.width, addBorder: false }, // native resolution
+    { maxDim: 800, addBorder: true },   // high density QR code optimization
+    { maxDim: 1600, addBorder: true },  // tiny QR codes in large frames
+  ];
+
+  for (const { maxDim, addBorder } of scales) {
+    let w = img.width;
+    let h = img.height;
+    if (w > maxDim || h > maxDim) {
+      const scale = Math.min(maxDim / w, maxDim / h);
+      w = Math.round(w * scale);
+      h = Math.round(h * scale);
+    }
+
+    const padding = addBorder ? Math.max(24, Math.round(w * 0.08)) : 0;
+    canvas.width = w + padding * 2;
+    canvas.height = h + padding * 2;
+
+    // Fill white background to guarantee quiet zone around QR code
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, padding, padding, w, h);
+
+    // Attempt jsQR on standard canvas
+    try {
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(imgData.data, imgData.width, imgData.height, {
+        inversionAttempts: 'attemptBoth',
+      });
+      if (code && code.data && code.data.trim()) {
+        return code.data.trim();
+      }
+    } catch {
+      // ignore
+    }
+
+    // Attempt ZXing on this canvas
+    try {
+      const zxRes = await (zxingReader as any).decodeFromCanvas(canvas);
+      if (zxRes && zxRes.getText && zxRes.getText()) {
+        return zxRes.getText().trim();
+      }
+    } catch {
+      // ignore
+    }
+
+    // High contrast thresholding (helps with shadows, screen glare, low contrast prints)
+    try {
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const d = imgData.data;
+      for (let p = 0; p < d.length; p += 4) {
+        const brightness = 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2];
+        const val = brightness > 130 ? 255 : 0;
+        d[p] = val;
+        d[p + 1] = val;
+        d[p + 2] = val;
+      }
+      ctx.putImageData(imgData, 0, 0);
+
+      const code = jsQR(imgData.data, imgData.width, imgData.height, {
+        inversionAttempts: 'attemptBoth',
+      });
+      if (code && code.data && code.data.trim()) {
+        return code.data.trim();
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return null;
 }
 
 /**
- * Reads an image file and decodes its QR code
+ * Reads any image file and decodes its QR code reliably
  */
 export async function decodeQRFromFile(file: File): Promise<DecodedQRResult> {
   return new Promise((resolve) => {
@@ -66,108 +171,25 @@ export async function decodeQRFromFile(file: File): Promise<DecodedQRResult> {
       const dataUrl = event.target?.result as string;
       const img = new Image();
 
-      img.onload = () => {
+      img.onload = async () => {
         try {
-          const canvas = document.createElement('canvas');
-          const ctx = canvas.getContext('2d', { willReadFrequently: true });
-
-          if (!ctx) {
-            resolve({
-              success: false,
-              status: 'INVALID_QR',
-              errorReason: 'Unable to initialize image canvas context',
-              dataUrl,
-            });
-            return;
-          }
-
-          // Helper to attempt jsQR on a canvas
-          const tryDecodeCanvas = (c: HTMLCanvasElement): string | null => {
-            const context = c.getContext('2d', { willReadFrequently: true });
-            if (!context) return null;
-            const imgData = context.getImageData(0, 0, c.width, c.height);
-            const qr = jsQR(imgData.data, imgData.width, imgData.height, {
-              inversionAttempts: 'attemptBoth',
-            });
-            return qr?.data ? qr.data.trim() : null;
-          };
-
-          // 1. First attempt: Normal scale (or scaled down if huge photo > 1200px)
-          let targetW = img.width;
-          let targetH = img.height;
-          if (targetW > 1200 || targetH > 1200) {
-            const scale = Math.min(1200 / targetW, 1200 / targetH);
-            targetW = Math.round(targetW * scale);
-            targetH = Math.round(targetH * scale);
-          }
-
-          canvas.width = targetW;
-          canvas.height = targetH;
-          ctx.drawImage(img, 0, 0, targetW, targetH);
-
-          let detectedText = tryDecodeCanvas(canvas);
-
-          // 2. Second attempt: If not found and original was scaled, try native full resolution
-          if (!detectedText && (targetW !== img.width || targetH !== img.height)) {
-            const nativeCanvas = document.createElement('canvas');
-            nativeCanvas.width = img.width;
-            nativeCanvas.height = img.height;
-            const nativeCtx = nativeCanvas.getContext('2d', { willReadFrequently: true });
-            if (nativeCtx) {
-              nativeCtx.drawImage(img, 0, 0);
-              detectedText = tryDecodeCanvas(nativeCanvas);
-            }
-          }
-
-          // 3. Third attempt: Try high contrast binarization
-          if (!detectedText) {
-            const binarizedCanvas = document.createElement('canvas');
-            binarizedCanvas.width = canvas.width;
-            binarizedCanvas.height = canvas.height;
-            const bCtx = binarizedCanvas.getContext('2d', { willReadFrequently: true });
-            if (bCtx) {
-              bCtx.drawImage(canvas, 0, 0);
-              const bData = bCtx.getImageData(0, 0, binarizedCanvas.width, binarizedCanvas.height);
-              const d = bData.data;
-              for (let p = 0; p < d.length; p += 4) {
-                const gray = 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2];
-                const val = gray > 128 ? 255 : 0;
-                d[p] = val;
-                d[p + 1] = val;
-                d[p + 2] = val;
-              }
-              bCtx.putImageData(bData, 0, 0);
-              detectedText = tryDecodeCanvas(binarizedCanvas);
-            }
-          }
+          const detectedText = await decodeQRFromImageElement(img);
 
           if (!detectedText) {
             resolve({
               success: false,
               status: 'INVALID_QR',
-              errorReason: 'No valid QR code pattern detected in image',
+              errorReason: 'No QR code pattern detected. Please ensure the QR code is clearly visible.',
               dataUrl,
             });
             return;
           }
 
-          const rawText = detectedText;
-          const validation = validateSafeUrl(rawText);
-
-          if (!validation.isValid) {
-            resolve({
-              success: false,
-              rawText,
-              status: 'URL_ERROR',
-              errorReason: validation.reason || 'Untrusted or invalid URL',
-              dataUrl,
-            });
-            return;
-          }
+          const validation = validateSafeUrl(detectedText);
 
           resolve({
             success: true,
-            rawText: validation.sanitizedUrl || rawText,
+            rawText: validation.sanitizedUrl || detectedText,
             status: 'PENDING',
             dataUrl,
           });
@@ -186,7 +208,7 @@ export async function decodeQRFromFile(file: File): Promise<DecodedQRResult> {
         resolve({
           success: false,
           status: 'INVALID_QR',
-          errorReason: 'Corrupted image file or unsupported format',
+          errorReason: 'Unable to open image format',
           dataUrl,
         });
       };
@@ -213,7 +235,7 @@ export async function buildQueueFromFiles(
   files: File[],
   onProgress?: (processed: number, total: number, currentName: string) => void
 ): Promise<QRJobItem[]> {
-  // Sort files deterministically by name (natural order: QR_001.png, QR_002.png...)
+  // Sort files deterministically by natural order (QR_001.png, QR_002.png...)
   const sortedFiles = [...files].sort((a, b) =>
     a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
   );

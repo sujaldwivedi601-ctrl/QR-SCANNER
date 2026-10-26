@@ -225,6 +225,7 @@ export default function App() {
             {activeTab === 'scanner' && (
               <LiveScanner
                 onStartAutomationFlow={() => setShowWizard(true)}
+                phoneNumbers={phoneNumbers}
                 onScannedSingleUrl={(url) => {
                   console.log('Scanned QR:', url);
                 }}

@@ -72,11 +72,19 @@ export const AutomationWizard: React.FC<AutomationWizardProps> = ({
     });
   };
 
+  const sanitizeMobile = (val: string) => {
+    const digits = val.replace(/\D/g, '');
+    if (digits.length === 12 && digits.startsWith('91')) return digits.substring(2);
+    if (digits.length === 11 && digits.startsWith('0')) return digits.substring(1);
+    if (digits.length > 10) return digits.slice(-10);
+    return digits || val.trim();
+  };
+
   const handleSaveInitialForm = (e: React.FormEvent) => {
     e.preventDefault();
-    const p1 = phone1.trim();
-    const p2 = phone2.trim();
-    const p3 = phone3.trim();
+    const p1 = sanitizeMobile(phone1);
+    const p2 = sanitizeMobile(phone2);
+    const p3 = phone3.trim() ? sanitizeMobile(phone3) : '';
 
     if (!p1 || !p2) {
       alert('Please enter at least 2 phone numbers (Number 1 and Number 2).');
