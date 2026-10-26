@@ -1,0 +1,6 @@
+{
+  "name": "QR Flow Automator",
+  "description": "Production-grade automated QR-code web workflow runner with phone rotation, FIFO queue, and authorized OTP handling.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
