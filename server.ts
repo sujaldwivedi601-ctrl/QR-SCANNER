@@ -549,11 +549,19 @@ async function runPlaywrightWorkflow(
     const valueToFill = (isNumberField || isIntlTel) ? clean10DigitNumber : (clean10DigitNumber || phoneNumber);
 
     addLog('FIND_PHONE', 'success', `Found phone input element (${selectedSelector})`);
+    
+    // Explicitly toggle autocomplete="off" to autocomplete="tel" on the DOM element
+    await phoneHandle.evaluate((el: HTMLInputElement) => {
+      el.setAttribute('autocomplete', 'tel');
+      el.removeAttribute('autocomplete'); // in case modern browser ignores off
+      el.setAttribute('autocomplete', 'tel');
+    }).catch(() => {});
+
     await phoneHandle.click();
     await phoneHandle.fill(valueToFill);
     await phoneHandle.dispatchEvent('input');
     await phoneHandle.dispatchEvent('change');
-    addLog('FILL_PHONE', 'info', `Entered authorized phone: ${valueToFill}`);
+    addLog('FILL_PHONE', 'info', `Entered authorized phone: ${valueToFill} (autocomplete enabled)`);
 
     // Step D: Detect "Generate OTP" / "Send OTP" button
     addLog('FIND_OTP_BUTTON', 'info', `Detecting OTP generation button...`);
